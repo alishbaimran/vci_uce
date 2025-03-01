@@ -61,11 +61,22 @@ def main(args):
     datasets_df = pd.read_csv(args.dataset_path)
     sorted_dataset_names = sorted(datasets_df["names"])
     shapes_dict = utils.get_shapes_dict(dataset_path=args.dataset_path)
-    TOTAL_N_CELL = 36238464 # 35755720 # 1087158 # 35755720 # 27178832 # 9059574 # 18119211 # 36238464
+
+    dataset = MultiDatasetSentences(sorted_dataset_names, shapes_dict, args)
+    TOTAL_N_CELL = len(dataset) # 35755720 # 1087158 # 35755720 # 27178832 # 9059574 # 18119211 # 36238464
     EPOCH_LENGTH = int(TOTAL_N_CELL // args.batch_size // 24)
     warmup_steps = EPOCH_LENGTH * 6 # ? not sure why this needs to be included but seems empirical?? no clue why this is 6
     SAVE_EVERY = (EPOCH_LENGTH // 2) + 4  # avoid saving an extra time
-    dataset = MultiDatasetSentences(sorted_dataset_names, shapes_dict, args)
+    # Get actual number of cells (samples) directly from dataset
+    print("PAD LENGTH:")
+    print(args.pad_length)
+
+    # Compute true steps per epoch
+    true_steps_per_epoch = TOTAL_N_CELL // args.batch_size
+
+    print(f"Total cells loaded: {TOTAL_N_CELL}")
+    print(f"Ground truth steps per epoch (full pass through all data): {true_steps_per_epoch}")
+    
     multi_dataset_sentence_collator = MultiDatasetSentenceCollator(args)
     
     # Make the dataloader outside of the 
@@ -85,8 +96,7 @@ def main(args):
                          compiled=False,
                          num_datasets=len(sorted_dataset_names),
                          max_lr=args.max_lr,
-                         dataset_embedding_dim=args.dataset_embedding_dim
-                       )
+                         dataset_embedding_dim=args.dataset_embedding_dim, args=args)
 
     all_pe = get_ESM2_embeddings(args)
     all_pe.requires_grad = args.fine_tune_embeds
@@ -110,7 +120,7 @@ def main(args):
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.checkpoint_dir,
         filename=f"{args.run_name}" + "-{epoch}-{step}.pt",
-        every_n_epochs=1,
+        every_n_train_steps=50000,
         save_top_k=-1
     )
 
@@ -185,6 +195,10 @@ if __name__=="__main__":
     parser.add_argument('--num_nodes', type=int, default=1, help='Number of training nodes')
     parser.add_argument('--checkpoint_dir', type=str, required=True)
     parser.add_argument('--run_name', type=str, required=True)
+    parser.add_argument('--mask_target_pct', type=float, default=0.15, help='Target percent of tokens to mask')
+    parser.add_argument('--loss_name', type=str, default='cross_entropy', help='Loss function (cross_entropy, etc.)')
+    parser.add_argument('--mmd_weight', type=float, default=0.1, help='Weight for MMD loss when using bce_mmd loss')
+
     args = parser.parse_args()
     torch.set_float32_matmul_precision("medium")
     main(args)

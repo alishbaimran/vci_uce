@@ -2,6 +2,8 @@
 Model class
 
 """
+import torch._dynamo
+torch._dynamo.config.optimize_ddp = False
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -18,7 +20,7 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ChainedScheduler, LinearLR, LRScheduler, CosineAnnealingLR
 from torch.optim import Optimizer
 import numpy as np
-
+from loss import MMDLoss
 
 def full_block(in_features, out_features, p_drop=0.1):
     return nn.Sequential(
@@ -27,7 +29,6 @@ def full_block(in_features, out_features, p_drop=0.1):
         nn.GELU(),
         nn.Dropout(p=p_drop),
     )
-
 
 class SkipBlock(nn.Module):
     def __init__(self, in_features):
@@ -101,11 +102,9 @@ class PositionalEncoding(nn.Module):
 
 class LitUCEModel(L.LightningModule):
     def __init__(self, token_dim: int, d_model: int, nhead: int, d_hid: int,
-                 nlayers: int, output_dim:int, dropout: float = 0.0, 
+                 nlayers: int, output_dim:int, args: Any, dropout: float = 0.0, 
                  warmup_steps: int = 0, gradient_accumulation_steps: int = 1,
-                 compiled: bool = False, num_datasets: int = 0, dataset_embedding_dim: int = 16, max_lr=4e-4
-                
-                ):
+                 compiled: bool = False, num_datasets: int = 0, dataset_embedding_dim: int = 16, max_lr=4e-4):
         super().__init__()
         self.save_hyperparameters()
         self.compiled = compiled
@@ -116,6 +115,7 @@ class LitUCEModel(L.LightningModule):
         self.dropout = dropout
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_lr = max_lr
+        self.args = args
         # Encodes Tokens
         self.encoder = nn.Sequential(#SkipBlock(token_dim), # Add an extra layer here with skip connection
                                      nn.Linear(token_dim, d_model, bias=True),
@@ -194,13 +194,12 @@ class LitUCEModel(L.LightningModule):
             (torch.hstack((cell_embedding, gene_embeddings)))
         return dec
 
-    
     def shared_step(self, batch, batch_idx):
-        criterion = BCEWithLogitsLoss()
         batch_sentences = batch[0]
         mask = batch[1]
         cell_outputs_X_pe = batch[2]
         cell_outputs_Y = batch[3]
+
         dataset_nums = batch[5]
 
         batch_sentences = self.pe_embedding(
@@ -215,18 +214,65 @@ class LitUCEModel(L.LightningModule):
         
         X = cell_outputs_X_pe
         Y = cell_outputs_Y
+
         X = self.gene_embedding_layer(X)
         embs = embedding.unsqueeze(1).repeat(1, X.shape[1], 1)
         # add dataset num to decoder
         #dataset_num_emb = dataset_num_emb.unsqueeze(1).repeat(1, X.shape[1], 1) # batch x (P+N) x emb
-        
+        print("shape of X")
+        print(X.shape)
+        print("shape of embs")
+        print(embs.shape)
         #combine = torch.cat((X, embs, dataset_num_emb), dim=2)
         combine = torch.cat((X, embs), dim=2) # remove dataset value
+        # if torch.isnan(combine).any():
+        #     print(f"[ERROR] NaN detected in 'combine' at batch {batch_idx}")
+
         decs = self.binary_decoder(combine)
-        loss = criterion(input=decs.squeeze(), target=Y)
+
+        # if torch.isnan(decs).any():
+        #     print(f"[ERROR] NaN detected in 'decs' at batch {batch_idx}")
+
+        if self.args.loss_name == "cross_entropy":
+            if torch.isnan(decs).any():
+                print(f"[ERROR] NaN detected in 'decs' at batch {batch_idx}")
+
+            bce_loss = BCEWithLogitsLoss()(decs.squeeze(), Y)
+            total_loss = bce_loss
+        
+        elif self.args.loss_name == "only_mmd":
+            mmd_loss = MMDLoss(kernel="energy")(decs.squeeze(), cell_outputs_Y)
+            total_loss = mmd_loss
+        
+        elif self.args.loss_name == "bce_mmd":
+            print(Y.shape)
+            expressed_mask = (Y > 0.5)  # shape [batch_size, P+N]
+                        
+            print(expressed_mask.shape)
+            print(combine.shape)
+            # Ensure the mask is expanded to match the 3D structure of `combine`
+            expressed_embeddings = combine[expressed_mask.unsqueeze(-1).expand_as(combine)].view(-1, combine.shape[-1])
+            unexpressed_embeddings = combine[(~expressed_mask).unsqueeze(-1).expand_as(combine)].view(-1, combine.shape[-1])
+
+
+
+            # expressed_embeddings = expressed_embeddings[~torch.isnan(expressed_embeddings).any(dim=1)]
+            # unexpressed_embeddings = unexpressed_embeddings[~torch.isnan(unexpressed_embeddings).any(dim=1)]
+            print(f"Filtered expressed_embeddings shape: {expressed_embeddings.shape}")
+            print(f"Filtered unexpressed_embeddings shape: {unexpressed_embeddings.shape}")
+
+            mmd_loss = MMDLoss(kernel="energy")(expressed_embeddings, unexpressed_embeddings)
+
+            bce_loss = BCEWithLogitsLoss()(decs.squeeze(), Y)
+
+            total_loss = bce_loss - self.args.mmd_weight * mmd_loss
+        
+        else:
+            raise ValueError(f"Unsupported loss name: {self.args.loss.name}")
+
         sch = self.lr_schedulers()
         sch.step()
-        return loss, batch_sentences.shape[1]
+        return total_loss, batch_sentences.shape[1]
 
     @torch.compile(disable=True)
     def training_step(self, batch, batch_idx):

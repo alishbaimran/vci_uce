@@ -12,6 +12,7 @@ import torch
 import numpy as np
 import pickle
 import torch.utils.data as data
+import torch.nn.functional as F
 
 
 class MultiDatasetSentences(data.Dataset):
@@ -37,6 +38,12 @@ class MultiDatasetSentences(data.Dataset):
         # TODO: preferably not hard-coded here
         self.dataset_to_protein_embeddings = torch.load(
             f"/scratch/ctc/ML/uce/reduced_datasets_to_pe_chrom_{args.token_dim}_new.torch")
+        
+        for k, v in self.dataset_to_protein_embeddings.items():
+            if torch.isnan(v).any():
+                print(f"[ERROR] NaN detected in dataset_to_protein_embeddings for {k}")
+                raise ValueError(f"NaNs detected in pre-loaded embeddings for {k}")
+
         with open("/scratch/ctc/ML/uce/dataset_to_chroms_new.pkl", "rb") as f:
             self.dataset_to_chroms = pickle.load(f)
         with open("/scratch/ctc/ML/uce/dataset_to_starts_new.pkl", "rb") as f:
@@ -54,12 +61,11 @@ class MultiDatasetSentences(data.Dataset):
                     counts = torch.tensor(counts).unsqueeze(0)
                     weights = torch.log1p(counts)
                     weights = (weights / torch.sum(weights))
-                    batch_sentences, mask, cell_outputs_X_pe, \
-                    cell_outputs_Y, seq_len = \
-                        sample_cell_sentences(counts, weights, dataset, self.args,
-                            dataset_to_protein_embeddings= self.dataset_to_protein_embeddings,
-                            dataset_to_chroms=self.dataset_to_chroms,
-                            dataset_to_starts=self.dataset_to_starts)
+                    #cell_outputs_X_pe is getting task_sentence and cell_outputs_Y gets the task_counts
+                    batch_sentences, mask, cell_outputs_X_pe, cell_outputs_Y = sample_cell_sentences(
+                        counts, dataset, self.args, self.dataset_to_protein_embeddings
+                    )
+                    seq_len = self.args.pad_length
                     dataset_num = self.datasets_to_num[dataset]
                     return batch_sentences, mask, cell_outputs_X_pe, cell_outputs_Y, idx, seq_len, dataset_num
                 else:
@@ -114,124 +120,99 @@ class MultiDatasetSentenceCollator(object):
         return batch_sentences[:, :max_len] , mask[:, :max_len], Xs, Ys, idxs, dataset_nums.long()
 
 
-
-def sample_cell_sentences(counts, batch_weights, dataset, args,
-                          dataset_to_protein_embeddings,
-                          dataset_to_chroms,
-                          dataset_to_starts):
+def sample_cell_sentences(counts, dataset, args, dataset_to_protein_embeddings):
     
-    dataset_idxs = dataset_to_protein_embeddings[dataset]
+    if torch.isnan(counts).any():
+        raise ValueError(f"NaN values in counts for dataset {dataset}")
+
+    if torch.any(counts < 0):
+        print("less than 0 count found")
+        counts = F.relu(counts)
+
+    max_val = torch.max(counts).item()
+    min_val = torch.min(counts).item()
+
+    if max_val > 20:
+        counts = torch.log1p(counts)
+    # else:
+    #     print(f"Counts are already log-transformed (max={max_val:.2f}, min={min_val:.2f})")
+
+
+    expression_weights = counts / torch.sum(counts)
+
+    ds_emb_idxs = dataset_to_protein_embeddings[dataset]
     cell_sentences = torch.zeros((counts.shape[0], args.pad_length))
-    # pos = adata.X > 0
-    mask = torch.zeros((counts.shape[0], args.pad_length), dtype=bool)
-
-    chroms = dataset_to_chroms[dataset]
-    starts = dataset_to_starts[dataset]
-
-    longest_seq_len = 0
-    cell_outputs_X = torch.zeros((counts.shape[0], args.P + args.N))
-    cell_outputs_Y = torch.zeros((counts.shape[0], args.P + args.N))
+    task_counts = torch.zeros((counts.shape[0], args.P + args.N))
+    task_sentence = torch.zeros((counts.shape[0], args.P + args.N))
+    mask = torch.zeros((counts.shape[0], args.pad_length), dtype=torch.bool)
 
     for c, cell in enumerate(counts):
-        pos_genes = torch.where(counts[c] > 0)[0]
-        neg_genes = torch.where(counts[c] < 1)[0]
-        if len(pos_genes) == 0:
-            pos_genes = neg_genes
+        num_pos_genes = torch.sum(cell > 0)
+        start_sentence = min((args.pad_length - 1) // 2, num_pos_genes)
 
-        weights = batch_weights[c].numpy()
-        # pos_gene_embeds = adata_pe[pos_genes]
+        genes_ranked_exp = torch.argsort(cell, descending=True)
 
-        # randomly choose some pos genes to mask out.
+        cell_sentences[c, 0] = args.cls_token_idx
+        cell_sentences[c, 1: start_sentence + 1] = genes_ranked_exp[:start_sentence]
 
-        # start with 20% random dropout
-        mask_weights = np.random.choice(pos_genes,
-                                        size=round(len(pos_genes) * args.mask_prop),
-                                        replace=False)
-        # Clip so no value is 10x larger than smaller value.
-        #min_val = np.min(cell[pos_genes])
-        #new_max_val = (min_val * 10)
-        #proportion_clipped = np.mean(cell[pos_genes] > new_max_val)
-        
-        weights[mask_weights] = 0  # drop these out
-        weights = weights / sum(weights)  # RE NORM after mask
-        # clip
-        #weights = np.clip(weights, a_min=0, a_max=0.005) # P(binomial(1024, 0.005) >= 10) = 0.036
-        #weights = weights / sum(weights)  # RE NORM after clip
-        # mask.append(torch.ones(sample_size))
-        choice_idx = np.random.choice(np.arange(len(weights)),
-                                      size=args.sample_size, p=weights,
-                                      replace=True)
-        choosen_chrom = chroms[choice_idx]
-        chrom_sort = np.argsort(choosen_chrom)  # order by chromsome
-        choice_idx = choice_idx[chrom_sort]  # now ordered by chrom
+        cell_sentences[c, start_sentence + 1:] = torch.multinomial(
+            expression_weights, args.pad_length - start_sentence - 1, replacement=True
+        )
 
-        # sort by start
-        new_chrom = chroms[choice_idx]
-        choosen_starts = starts[choice_idx]
+        cell_sentences[c, :] = ds_emb_idxs[cell_sentences[c, :].to(torch.int32)]
 
-        ordered_choice_idx = np.full((args.pad_length),
-                                     args.cls_token_idx)  # start with cls
-        # i= 0 first token is CLS
-        i = 1  # continue on to the rest of the sequence with left bracket being assumed.\
-        # Shuffle the chroms now
-        uq_chroms = np.unique(new_chrom)
-        np.random.shuffle(uq_chroms) # shuffle
-        for chrom in uq_chroms:
-            # Open Chrom
-            ordered_choice_idx[i] = int(chrom) + args.CHROM_TOKEN_OFFSET # token of this chromosome # i = 1 next token is a chrom open
-            i += 1
-            # now sort the by start order within the chroms
-            loc = np.where(new_chrom == chrom)[0]
-            sort_by_start = np.argsort(
-                choosen_starts[loc])  # start locations for these chromsomes
-
-            to_add = choice_idx[loc[sort_by_start]]
-            ordered_choice_idx[i:(i + len(to_add))] = dataset_idxs[to_add]  # convert
-            i += len(to_add)
-            ordered_choice_idx[i] = args.chrom_token_right_idx # add the chrom sep again
-            i += 1  # add the closing token again
-
-        longest_seq_len = max(longest_seq_len, i)
-        remainder_len = (args.pad_length - i)
-
-        cell_mask = torch.concat((torch.zeros(i, dtype=bool),
-                                  # pay attention to all of these tokens, ignore the rest!
-                                  torch.ones(remainder_len, dtype=bool)))
-
-        mask[c, :] = cell_mask
-
-        ordered_choice_idx[i:] = args.pad_token_idx  # mask
-
-        # sample_row = pos_gene_embeds[choice_idx, :]
-        cell_sentences[c, :] = torch.from_numpy(ordered_choice_idx)
-        choice_idx_ouput_p = mask_weights  # use the masked genes as task
-        if len(choice_idx_ouput_p) > args.P:
-            choice_idx_ouput_p = np.random.choice(choice_idx_ouput_p,
-                                                  replace=False,
-                                                  size=args.P)  # subset of masked genes
-        elif len(choice_idx_ouput_p) < args.P:
-            remainder = args.P - len(choice_idx_ouput_p)  # remaining to be choosen
-            choice_idx_ouput_p = np.append(choice_idx_ouput_p,
-                                           np.random.choice(pos_genes,
-                                                            size=remainder,
-                                                            replace=True))  # choose more
-
-        # choice_idx_ouput_p = pos_genes[choice_idx_ouput_p]
-        if args.N <= len(neg_genes):
-            choice_idx_ouput_n = np.random.choice(np.arange(len(neg_genes)),
-                                                  size=args.N, replace=False)
+        exp_genes = torch.where(cell > 0)[0]
+        if len(exp_genes) > args.P:
+            task_sentence[c, :args.P] = exp_genes[torch.randperm(len(exp_genes))[:args.P]]
         else:
-            choice_idx_ouput_n = np.random.choice(np.arange(len(neg_genes)),
-                                                  size=args.N, replace=True)
+            task_sentence[c, :args.P] = exp_genes[torch.randint(len(exp_genes), (args.P,))]
 
-        choice_idx_ouput_n = neg_genes[choice_idx_ouput_n]
+        unexp_genes = torch.where(cell == 0)[0]
+        if len(unexp_genes) == 0:
+            print("using fallback for unexpressed genes")
+            unexp_genes = torch.where(cell < 1)[0]
 
-        cell_outputs_X[c] = torch.tensor(
-            np.concatenate((choice_idx_ouput_p, choice_idx_ouput_n)))
-        cell_outputs_Y[c] = torch.cat((torch.ones(args.P), torch.zeros(args.N)))
+        if len(unexp_genes) > args.N:
+            task_sentence[c, args.P:] = unexp_genes[torch.randperm(len(unexp_genes))[:args.N]]
+        else:
+            task_sentence[c, args.P:] = unexp_genes[torch.randint(len(unexp_genes), (args.N,))]
 
-    cell_sentences_pe = cell_sentences.long()  # .unsqueeze(2) # all_pe[cell_sentences.long(), :]
-    cell_outputs_X_pe = dataset_idxs[
-        cell_outputs_X.long()]  # .unsqueeze(2) # all_pe[dataset_idxs[cell_outputs_X.long()], :]
+        task_counts[c] = cell[task_sentence[c].to(torch.int32)]
 
-    return cell_sentences_pe, mask, cell_outputs_X_pe, cell_outputs_Y, args.pad_length
+        if args.loss_name in ["cross_entropy", "bce_mmd"]:
+            task_counts[c] = (task_counts[c] > 0).float()
+
+        task_sentence[c] = ds_emb_idxs[task_sentence[c].to(torch.int32)]
+
+        task_gene_set = torch.tensor(task_sentence[c].tolist(), dtype=cell_sentences.dtype)
+        potential_mask = torch.isin(cell_sentences[c], task_gene_set)
+
+        target_mask_count = int(args.mask_target_pct * args.pad_length)
+        current_mask_count = potential_mask.sum().item()
+
+        if current_mask_count > target_mask_count:
+            mask_indices = torch.where(potential_mask[1:])[0] + 1
+            keep_indices = torch.randperm(len(mask_indices))[:target_mask_count]
+            selected_indices = mask_indices[keep_indices]
+
+            final_mask = torch.zeros_like(potential_mask)
+            final_mask[selected_indices] = True
+            mask[c] = final_mask
+        elif current_mask_count < target_mask_count:
+            non_masked = ~potential_mask
+            non_masked_indices = torch.where(non_masked[1:])[0] + 1
+
+            additional_needed = target_mask_count - current_mask_count
+            additional_needed = min(additional_needed, len(non_masked_indices))
+
+            if len(non_masked_indices) > 0 and additional_needed > 0:
+                additional_indices = non_masked_indices[torch.randperm(len(non_masked_indices))[:additional_needed]]
+                potential_mask[additional_indices] = True
+
+            mask[c] = potential_mask
+        else:
+            mask[c] = potential_mask
+
+        mask[c, 0] = False
+
+    return cell_sentences.long(), mask, task_sentence.long(), task_counts

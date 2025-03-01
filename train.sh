@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=vci_train
-#SBATCH --partition=vci_gpu_priority
+#SBATCH --partition=gpu_batch
 #SBATCH --gpus=1
 #SBATCH --output=logs/vci_train_%j.log
 #SBATCH --time=5-00:00:00
@@ -9,7 +9,7 @@
 source ~/.bashrc
 conda activate vci-f
 
-MODEL_RUN_NAME="UCE_plain"
+MODEL_RUN_NAME="MMD_updatedsampling"
 CHECKPOINT_DIR="/scratch/ctc/ML/uce/model_checkpoints/${MODEL_RUN_NAME}_${SLURM_JOB_ID}"
 
 mkdir -p ${CHECKPOINT_DIR}
@@ -21,7 +21,7 @@ mkdir -p ${TRITON_CACHE_DIR}
 python train_lit.py \
     --sample_size=1024 \
     --nlayers=4 \
-    --pad_length=1425 \
+    --pad_length=2048 \
     --compiled \
     --emsize=512 \
     --d_hid=2048 \
@@ -33,5 +33,9 @@ python train_lit.py \
     --token_dim=5120 \
     --emb_model_name=ESM2_base \
     --dataset_path=/scratch/ctc/ML/uce/full_train_datasets.csv \
+    --mask_target_pct=0.2\
+    --loss_name="only_mmd"\
+    --N=512\
+    --P=512\
     --checkpoint_dir=${CHECKPOINT_DIR} \
     --run_name=${MODEL_RUN_NAME}_${SLURM_JOB_ID}
