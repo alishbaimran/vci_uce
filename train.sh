@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=vci_train
-#SBATCH --partition=gpu_batch
+#SBATCH --partition=preemptible
 #SBATCH --gpus=1
 #SBATCH --output=logs/vci_train_%j.log
 #SBATCH --time=5-00:00:00
@@ -9,7 +9,7 @@
 source ~/.bashrc
 conda activate vci-f
 
-MODEL_RUN_NAME="MMD_updatedsampling"
+MODEL_RUN_NAME="debug_mmd_bce"
 CHECKPOINT_DIR="/scratch/ctc/ML/uce/model_checkpoints/${MODEL_RUN_NAME}_${SLURM_JOB_ID}"
 
 mkdir -p ${CHECKPOINT_DIR}
@@ -34,7 +34,7 @@ python train_lit.py \
     --emb_model_name=ESM2_base \
     --dataset_path=/scratch/ctc/ML/uce/full_train_datasets.csv \
     --mask_target_pct=0.2\
-    --loss_name="only_mmd"\
+    --loss_name="cross_entropy"\
     --N=512\
     --P=512\
     --checkpoint_dir=${CHECKPOINT_DIR} \

@@ -225,8 +225,14 @@ class LitUCEModel(L.LightningModule):
         print(embs.shape)
         #combine = torch.cat((X, embs, dataset_num_emb), dim=2)
         combine = torch.cat((X, embs), dim=2) # remove dataset value
-        # if torch.isnan(combine).any():
-        #     print(f"[ERROR] NaN detected in 'combine' at batch {batch_idx}")
+        if torch.isnan(X).any():
+            print(f"[ERROR] NaN detected in 'X' at batch {batch_idx}")
+
+        if torch.isnan(embs).any():
+            print(f"[ERROR] NaN detected in 'embs' at batch {batch_idx}")
+        
+        if torch.isnan(combine).any():
+            print(f"[ERROR] NaN detected in 'combine' at batch {batch_idx}")
 
         decs = self.binary_decoder(combine)
 
@@ -241,25 +247,32 @@ class LitUCEModel(L.LightningModule):
             total_loss = bce_loss
         
         elif self.args.loss_name == "only_mmd":
+            print("decs")
+            print(decs.squeeze().shape)
+            print(cell_outputs_Y.shape)
             mmd_loss = MMDLoss(kernel="energy")(decs.squeeze(), cell_outputs_Y)
             total_loss = mmd_loss
         
         elif self.args.loss_name == "bce_mmd":
-            print(Y.shape)
-            expressed_mask = (Y > 0.5)  # shape [batch_size, P+N]
-                        
-            print(expressed_mask.shape)
-            print(combine.shape)
-            # Ensure the mask is expanded to match the 3D structure of `combine`
-            expressed_embeddings = combine[expressed_mask.unsqueeze(-1).expand_as(combine)].view(-1, combine.shape[-1])
-            unexpressed_embeddings = combine[(~expressed_mask).unsqueeze(-1).expand_as(combine)].view(-1, combine.shape[-1])
+            # print("combine shape before filtering:", combine.shape)
+            # print(combine)
+            # Split combine into two halves along the last dimension
+            # Split along the second dimension (genes), so first 512 genes are "expressed", last 512 are "unexpressed"
+            combine_left, combine_right = torch.split(combine, 512, dim=1)
 
+            # Flatten for MMD
+            expressed_embeddings = combine_left.reshape(-1, combine.shape[-1])  # shape [24 * 512, 1024]
+            unexpressed_embeddings = combine_right.reshape(-1, combine.shape[-1])  # shape [24 * 512, 1024]
 
+            # print(f"Shape of expressed_embeddings (first half of genes): {expressed_embeddings.shape}")
+            # print(f"Shape of unexpressed_embeddings (second half of genes): {unexpressed_embeddings.shape}")
 
-            # expressed_embeddings = expressed_embeddings[~torch.isnan(expressed_embeddings).any(dim=1)]
-            # unexpressed_embeddings = unexpressed_embeddings[~torch.isnan(unexpressed_embeddings).any(dim=1)]
-            print(f"Filtered expressed_embeddings shape: {expressed_embeddings.shape}")
-            print(f"Filtered unexpressed_embeddings shape: {unexpressed_embeddings.shape}")
+            # Print some example values from both (first 3 genes from each)
+            # print("First 3 expressed embeddings:")
+            # print(expressed_embeddings[:3])
+
+            # print("First 3 unexpressed embeddings:")
+            # print(unexpressed_embeddings[:3])
 
             mmd_loss = MMDLoss(kernel="energy")(expressed_embeddings, unexpressed_embeddings)
 
