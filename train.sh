@@ -9,7 +9,7 @@
 source ~/.bashrc
 conda activate vci-f
 
-MODEL_RUN_NAME="UCE_plain"
+MODEL_RUN_NAME="UCE_plain_checkpoint"
 CHECKPOINT_DIR="/scratch/ctc/ML/uce/model_checkpoints/${MODEL_RUN_NAME}_${SLURM_JOB_ID}"
 
 mkdir -p ${CHECKPOINT_DIR}

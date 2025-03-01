@@ -110,7 +110,7 @@ def main(args):
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.checkpoint_dir,
         filename=f"{args.run_name}" + "-{epoch}-{step}.pt",
-        every_n_epochs=1,
+        every_n_train_steps=50000,
         save_top_k=-1
     )
 
